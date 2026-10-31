@@ -67,6 +67,30 @@ function getSizeForState(
   }
 }
 
+type WindowApi = typeof import('@tauri-apps/api/window')
+
+// Bottom-center of the monitor under the cursor (falls back to the capsule's own monitor).
+async function placeOnActiveMonitor(
+  api: WindowApi,
+  win: ReturnType<WindowApi['getCurrentWindow']>,
+  windowWidth: number,
+  windowHeight: number,
+): Promise<void> {
+  let monitor = null
+  try {
+    const cursor = await api.cursorPosition()
+    monitor = await api.monitorFromPoint(cursor.x, cursor.y)
+  } catch {
+    /* cursor position unavailable – fall back below */
+  }
+  monitor ??= await api.currentMonitor()
+  if (!monitor) return
+  const scale = monitor.scaleFactor
+  const x = Math.round(monitor.position.x + monitor.size.width / 2 - (windowWidth * scale) / 2)
+  const y = Math.round(monitor.position.y + monitor.size.height - (windowHeight + 80) * scale)
+  await win.setPosition(new api.PhysicalPosition(x, y)).catch(() => {})
+}
+
 export function useCapsuleResize() {
   const pipelineState = useAppStore((s) => s.pipelineState)
   const capsuleExpanded = useAppStore((s) => s.capsuleExpanded)
@@ -77,6 +101,7 @@ export function useCapsuleResize() {
   const capsuleAutoHide = useAppStore((s) => s.config.capsule_auto_hide)
   const initialized = useRef(false)
   const prevWindowSize = useRef<{ width: number; height: number } | null>(null)
+  const prevPipelineState = useRef<PipelineState>('idle')
 
   const hasError = pipelineError !== null
 
@@ -99,8 +124,13 @@ export function useCapsuleResize() {
       pipelineState,
     })
 
+    // A dictation session just began: follow the user to whichever monitor they are on.
+    const sessionStarting = prevPipelineState.current === 'idle' && pipelineState !== 'idle'
+    prevPipelineState.current = pipelineState
+
     import('@tauri-apps/api/window')
-      .then(async ({ getCurrentWindow, LogicalSize, LogicalPosition, currentMonitor }) => {
+      .then(async (api) => {
+        const { getCurrentWindow, LogicalSize, LogicalPosition, currentMonitor } = api
         const win = getCurrentWindow()
         await win.setFocusable(getCapsuleFocusable()).catch(() => {})
 
@@ -108,14 +138,7 @@ export function useCapsuleResize() {
           // First mount: position at bottom-center of screen, then show
           await win.setSize(new LogicalSize(windowWidth, windowHeight)).catch(() => {})
           try {
-            const monitor = await currentMonitor()
-            if (monitor) {
-              const sw = monitor.size.width / monitor.scaleFactor
-              const sh = monitor.size.height / monitor.scaleFactor
-              const x = Math.round(sw / 2 - windowWidth / 2)
-              const y = Math.round(sh - windowHeight - 80)
-              await win.setPosition(new LogicalPosition(x, y)).catch(() => {})
-            }
+            await placeOnActiveMonitor(api, win, windowWidth, windowHeight)
           } catch {
             /* ignore – monitor info unavailable */
           }
@@ -133,7 +156,10 @@ export function useCapsuleResize() {
         // Since content is always padded 12px each side, the capsule at x=12
         // is identical to a centered capsule — so the mic icon never moves.
         const prev = prevWindowSize.current
-        if (prev) {
+        if (sessionStarting) {
+          await placeOnActiveMonitor(api, win, windowWidth, windowHeight)
+          await win.setSize(new LogicalSize(windowWidth, windowHeight)).catch(() => {})
+        } else if (prev) {
           const pos = await win.outerPosition().catch(() => null)
           if (pos) {
             const monitor = await currentMonitor()
